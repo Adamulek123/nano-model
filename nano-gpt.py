@@ -14,7 +14,9 @@ block_size = 128 # what is the maximum context length for predictions?
 max_iters = 100
 eval_interval = 50
 learning_rate = 3e-4
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is required. Install a CUDA/ROCm-enabled PyTorch build and rerun.")
+device = torch.device("cuda")
 eval_iters = 50
 n_embd = 384
 n_head = 8
@@ -22,46 +24,22 @@ n_kv_head = 2
 n_layer = 6
 dropout = 0.2
 warmup_steps = 5 # exclude startup transients from summary stats
-use_amp = torch.amp.autocast_mode.is_autocast_available(device.type)
 amp_dtype = torch.bfloat16
-grad_scaler_ctor = getattr(torch.amp, "GradScaler", None)
-grad_scaler = None
-if use_amp and grad_scaler_ctor is not None:
-    try:
-        grad_scaler = grad_scaler_ctor(device.type, enabled=True)
-    except Exception:
-        try:
-            grad_scaler = grad_scaler_ctor(enabled=True)
-        except Exception:
-            grad_scaler = None
 # ------------
 
-print(
-    f"mixed precision: autocast={'on' if use_amp else 'off'} "
-    f"(dtype={amp_dtype if use_amp else 'n/a'}), "
-    f"grad_scaler={'on' if grad_scaler is not None else 'off'}"
-)
+print(f"runtime: cuda_device={torch.cuda.get_device_name(device)}, autocast_dtype={amp_dtype}")
 
 def is_power_of_two(x):
     return x > 0 and (x & (x - 1) == 0)
 
-def synchronize_for_timing(device, sync_tensor=None):
+def synchronize_for_timing():
     """Synchronize device work before reading wall-clock timing."""
-    device_type = getattr(device, 'type', '')
-
-    if device_type == 'cuda' and torch.cuda.is_available():
-        torch.cuda.synchronize(device)
-        return
-
-    # Fallback for async backends: force a blocking read to CPU.
-    if sync_tensor is None:
-        sync_tensor = torch.empty((), device=device)
-    _ = sync_tensor.detach().to('cpu')
+    torch.cuda.synchronize(device)
     
 
-def measure_step_metrics(step_start_time, tokens_processed, device, sync_tensor=None):
+def measure_step_metrics(step_start_time, tokens_processed):
     """Return per-step latency in milliseconds and throughput in tokens/sec."""
-    synchronize_for_timing(device, sync_tensor=sync_tensor)
+    synchronize_for_timing()
     dt_seconds = time.perf_counter() - step_start_time
     dt_ms = dt_seconds * 1000.0
     tokens_per_second = tokens_processed / dt_seconds if dt_seconds > 0 else float('inf')
@@ -73,7 +51,6 @@ assert n_head % n_kv_head == 0, "n_head must be divisible by n_kv_head"
 assert n_embd % n_head == 0, "n_embd must be divisible by n_head"
 
 torch.manual_seed(1337)
-#here use model = torch.compile(model) 
 torch.set_float32_matmul_precision('high')
 
 script_dir = Path(__file__).resolve().parent
@@ -126,7 +103,7 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype):
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -135,8 +112,6 @@ def estimate_loss():
 
 class GroupedQueryAttention(nn.Module):
     """ grouped-query attention with shared KV heads """
-
-    _mode_logged = False
 
     def __init__(self, num_query_heads, num_kv_heads, head_size):
         super().__init__()
@@ -156,38 +131,24 @@ class GroupedQueryAttention(nn.Module):
         self.attn_dropout_p = dropout
         self.resid_dropout = nn.Dropout(dropout)
 
-        if not GroupedQueryAttention._mode_logged:
-            print("GQA mode: grouped_sdpa_fallback")
-            GroupedQueryAttention._mode_logged = True
-
-    def _grouped_sdpa(self, q, k, v, attn_dropout):
-        head_outputs = []
-        for kv_idx in range(self.num_kv_heads):
-            q_start = kv_idx * self.query_heads_per_kv
-            q_end = q_start + self.query_heads_per_kv
-            q_group = q[:, q_start:q_end, :, :]
-            k_group = k[:, kv_idx:kv_idx+1, :, :].expand(-1, self.query_heads_per_kv, -1, -1)
-            v_group = v[:, kv_idx:kv_idx+1, :, :].expand(-1, self.query_heads_per_kv, -1, -1)
-
-            out_group = F.scaled_dot_product_attention(
-                q_group,
-                k_group,
-                v_group,
-                attn_mask=None,
-                dropout_p=attn_dropout,
-                is_causal=True,
-            )
-            head_outputs.append(out_group)
-        return torch.cat(head_outputs, dim=1)
-
     def forward(self, x):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.num_query_heads, self.head_size).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
+        if self.query_heads_per_kv > 1:
+            k = k.repeat_interleave(self.query_heads_per_kv, dim=1)
+            v = v.repeat_interleave(self.query_heads_per_kv, dim=1)
 
         attn_dropout = self.attn_dropout_p if self.training else 0.0
-        out = self._grouped_sdpa(q, k, v, attn_dropout)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=attn_dropout,
+            is_causal=True,
+        )
 
         out = out.transpose(1, 2).contiguous().view(B, T, n_embd)
         out = self.resid_dropout(self.proj(out))
@@ -275,8 +236,9 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
-model = BigramLanguageModel()
-m = model.to(device)
+model = BigramLanguageModel().to(device)
+model = torch.compile(model)
+m = model
 
 
 # create a PyTorch optimizer
@@ -339,25 +301,20 @@ with raw_log_path.open("w", newline="", encoding="utf-8") as csv_file:
         # sample a batch of data
         xb, yb = get_batch('train')
 
-        synchronize_for_timing(device, sync_tensor=yb)
+        synchronize_for_timing()
         step_start_time = time.perf_counter()
 
         # evaluate the loss
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype):
             logits, loss = model(xb, yb)
 
-        if grad_scaler is not None:
-            grad_scaler.scale(loss).backward()
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
+        loss.backward()
+        optimizer.step()
 
         tokens_step = yb.numel()
         tokens_seen += tokens_step
-        dt_ms, tokens_per_second = measure_step_metrics(step_start_time, tokens_step, device, sync_tensor=loss)
+        dt_ms, tokens_per_second = measure_step_metrics(step_start_time, tokens_step)
 
         is_warmup = iter < warmup_steps
         if not is_warmup:
@@ -403,9 +360,8 @@ summary_lines = [
     f"learning_rate={learning_rate}",
     f"max_iters={max_iters}",
     f"warmup_steps={warmup_steps}",
-    f"use_amp={use_amp}",
-    f"amp_dtype={amp_dtype if use_amp else 'none'}",
-    f"grad_scaler={'enabled' if grad_scaler is not None else 'disabled'}",
+    f"autocast_dtype={amp_dtype}",
+    f"torch_compile=enabled",
     f"tokens_seen={tokens_seen}",
     f"mean_tokens_per_s_excluding_warmup={mean_tokens_per_s_text}",
     f"median_dt_ms_excluding_warmup={median_dt_ms_text}",
