@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import sentencepiece as spm
 
 import time
 import csv
@@ -9,18 +8,20 @@ import statistics
 from datetime import datetime
 from pathlib import Path
 
+from data_loader import FineWebShardData
+
 # hyperparameters
 batch_size = 8  #  paraller predictions
-block_size = 64  # max context length for predictions
+block_size = 16  # max context length for predictions
 max_iters = 1000
-eval_interval = 50
+eval_interval = 200
 learning_rate = 3e-4
 if not torch.cuda.is_available():
     raise RuntimeError(
         "CUDA is required. Install a CUDA/ROCm-enabled PyTorch build and rerun."
     )
 device = torch.device("cuda")
-eval_iters = 50
+eval_iters = 10
 n_embd = 384
 n_head = 8
 n_kv_head = 2
@@ -64,52 +65,11 @@ torch.manual_seed(1337)
 torch.set_float32_matmul_precision("high")
 
 script_dir = Path(__file__).resolve().parent
-fineweb_dir = script_dir / "fineweb-edu-100M"
-spm_input_path = fineweb_dir / "spm_input.txt"
-tokenizer_model_path = fineweb_dir / "slm_unigram_24k.model"
 
-if not spm_input_path.exists():
-    raise FileNotFoundError(
-        f"Missing {spm_input_path}. Run parquet_to_text.py first to create spm_input.txt."
-    )
-if not tokenizer_model_path.exists():
-    raise FileNotFoundError(
-        f"Missing {tokenizer_model_path}. Run parquet_to_text.py first to create slm_unigram_24k.model."
-    )
-
-with spm_input_path.open("r", encoding="utf-8") as f:
-    text = f.read()
-
-sp = spm.SentencePieceProcessor(model_file=str(tokenizer_model_path))
-
-
-def encode(s):
-    return sp.encode_as_ids(s)
-
-
-def decode(ids):
-    return sp.decode_ids(ids)
-
-
-vocab_size = sp.get_piece_size()
-
-# Train and test splits
-data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9 * len(data))  # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
-print(f"train has {len(train_data)} tokens, val has {len(val_data)} tokens")
-
-
-# data loading
-def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == "train" else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i : i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
+data = FineWebShardData(batch_size=batch_size, block_size=block_size, device=device)
+decode = data.decode
+get_batch = data.get_batch
+vocab_size = data.vocab_size
 
 
 @torch.no_grad()
@@ -410,6 +370,7 @@ print(f"saved run summary: {summary_path}")
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
+model.eval()
 with torch.no_grad():
     print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
 # open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
