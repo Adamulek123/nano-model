@@ -11,10 +11,11 @@ from pathlib import Path
 from data_loader import FineWebShardData
 
 # hyperparameters
-batch_size = 8  #  paraller predictions
-block_size = 16  # max context length for predictions
-max_iters = 1000
-eval_interval = 200
+batch_size = 16  #  paraller predictions
+block_size = 32  # max context length for predictions
+max_iters = 10000
+eval_interval_procentage = 0.25
+eval_interval = max_iters * eval_interval_procentage
 learning_rate = 3e-4
 if not torch.cuda.is_available():
     raise RuntimeError(
@@ -29,6 +30,7 @@ n_layer = 6
 dropout = 0.2
 warmup_steps = 5  # exclude startup transients from summary stats
 amp_dtype = torch.bfloat16
+rope_base = 10000
 # ------------
 
 print(
@@ -54,6 +56,28 @@ def measure_step_metrics(step_start_time, tokens_processed):
         tokens_processed / dt_seconds if dt_seconds > 0 else float("inf")
     )
     return dt_ms, tokens_per_second
+
+
+def build_rope_cache(seq_len, head_dim, base=10000, device=device, dtype=amp_dtype):
+    if head_dim % 2 != 0:
+        raise ValueError("head_dim must be even for RoPE.")
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device) / head_dim))
+    positions = torch.arange(seq_len, device=device)
+    angles = positions[:, None] * inv_freq[None, :]
+    cos = angles.cos()
+    sin = angles.sin()
+    if dtype is not None:
+        cos = cos.to(dtype)
+        sin = sin.to(dtype)
+    return cos, sin
+
+
+def apply_rope(x, cos, sin):
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    x_rot_even = x_even * cos - x_odd * sin
+    x_rot_odd = x_even * sin + x_odd * cos
+    return torch.stack((x_rot_even, x_rot_odd), dim=-1).flatten(-2)
 
 
 assert is_power_of_two(n_head), "n_head must be a power of 2"
@@ -98,6 +122,7 @@ class GroupedQueryAttention(nn.Module):
         assert (
             num_query_heads % num_kv_heads == 0
         ), "num_query_heads must be divisible by num_kv_heads"
+        assert head_size % 2 == 0, "head_size must be even for RoPE"
 
         self.num_query_heads = num_query_heads
         self.num_kv_heads = num_kv_heads
@@ -110,6 +135,9 @@ class GroupedQueryAttention(nn.Module):
         self.proj = nn.Linear(n_embd, n_embd)
         self.attn_dropout_p = dropout
         self.resid_dropout = nn.Dropout(dropout)
+        self.rope_base = rope_base
+        self.register_buffer("rope_cos", torch.empty(0), persistent=False)
+        self.register_buffer("rope_sin", torch.empty(0), persistent=False)
 
     def forward(self, x):
         B, T, _ = x.shape
@@ -120,6 +148,28 @@ class GroupedQueryAttention(nn.Module):
         )
         k = self.k_proj(x).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
+
+        if (
+            self.rope_cos.numel() == 0
+            or self.rope_cos.size(0) < T
+            or self.rope_cos.device != q.device
+            or self.rope_cos.dtype != q.dtype
+        ):
+            cos, sin = build_rope_cache(
+                seq_len=T,
+                head_dim=self.head_size,
+                base=self.rope_base,
+                device=q.device,
+                dtype=q.dtype,
+            )
+            self.rope_cos = cos
+            self.rope_sin = sin
+
+        cos = self.rope_cos[:T].unsqueeze(0).unsqueeze(0)
+        sin = self.rope_sin[:T].unsqueeze(0).unsqueeze(0)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
         if self.query_heads_per_kv > 1:
             k = k.repeat_interleave(self.query_heads_per_kv, dim=1)
             v = v.repeat_interleave(self.query_heads_per_kv, dim=1)
@@ -180,7 +230,6 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(
             *[Block(n_embd, n_head=n_head, n_kv_head=n_kv_head) for _ in range(n_layer)]
         )
@@ -192,8 +241,7 @@ class BigramLanguageModel(nn.Module):
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T,C)
-        x = tok_emb + pos_emb  # (B,T,C)
+        x = tok_emb  # (B,T,C)
         x = self.blocks(x)  # (B,T,C)
         x = self.ln_f(x)  # (B,T,C)
         logits = self.lm_head(x)  # (B,T,vocab_size)
