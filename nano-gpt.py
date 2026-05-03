@@ -28,6 +28,7 @@ n_embd = 384
 n_head = 8
 n_kv_head = 2
 n_layer = 6
+moe_layer_set = {i for i in range(1, n_layer + 1) if i % 2 == 0}
 dropout = 0.2
 use_moe = True
 capacity_factor = 1.25
@@ -291,7 +292,7 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.blocks = nn.ModuleList()
         for i in range(n_layer):
-            use_moe_layer = use_moe and (i + 1) in {2, 4, 6}
+            use_moe_layer = use_moe and (i + 1) in moe_layer_set
             self.blocks.append(
                 Block(n_embd, n_head=n_head, n_kv_head=n_kv_head, use_moe=use_moe_layer)
             )
