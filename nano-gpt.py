@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+import math
 import time
 import csv
 import statistics
@@ -11,9 +12,9 @@ from pathlib import Path
 from data_loader import FineWebShardData
 
 # hyperparameters
-batch_size = 16  #  paraller predictions
-block_size = 32  # max context length for predictions
-max_iters = 10000
+batch_size = 32  #  paraller predictions
+block_size = 64  # max context length for predictions
+max_iters = 1000
 eval_interval_procentage = 0.25
 eval_interval = max_iters * eval_interval_procentage
 learning_rate = 3e-4
@@ -28,6 +29,10 @@ n_head = 8
 n_kv_head = 2
 n_layer = 6
 dropout = 0.2
+use_moe = True
+capacity_factor = 1.25
+num_experts = 4
+aux_loss_weight = 0.01
 warmup_steps = 5  # exclude startup transients from summary stats
 amp_dtype = torch.bfloat16
 rope_base = 10000
@@ -205,22 +210,76 @@ class FeedFoward(nn.Module):
         return self.net(x)
 
 
+class MoEFeedForward(nn.Module):
+    """Mixture of Experts feedforward layer"""
+
+    def __init__(self, n_embd, num_experts=4):
+        super().__init__()
+        self.num_experts = num_experts
+        self.router = nn.Linear(n_embd, num_experts)
+        self.experts = nn.ModuleList([FeedFoward(n_embd) for _ in range(num_experts)])
+
+    def forward(self, x):
+        # x: (B, T, C)
+        B, T, C = x.shape
+        x_flat = x.view(B * T, C)  # (tokens, C), tokens = B*T
+
+        router_logits = self.router(x_flat)  # (tokens, E)
+        router_probs = F.softmax(router_logits, dim=-1)  # (tokens, E)
+
+        top1_val, top1_idx = router_probs.max(dim=-1)  # (tokens,), (tokens,)
+        top1_mask = F.one_hot(
+            top1_idx, num_classes=self.num_experts
+        ).float()  # (tokens, E)
+
+        capacity = int(math.ceil(capacity_factor * (B * T) / self.num_experts))
+
+        positions = torch.cumsum(top1_mask, dim=0) - 1  # (tokens, E)
+        dispatch_mask = (positions < capacity) * top1_mask  # (tokens, E)
+
+        importance = router_probs.mean(dim=0)  # (E,)
+        load = dispatch_mask.mean(dim=0)  # (E,)
+        aux_loss = (importance * load).sum() * self.num_experts  # scalar
+        out_flat = torch.zeros_like(x_flat)  # (tokens, C)
+
+        for e in range(self.num_experts):
+            expert_mask = dispatch_mask[:, e].bool()  # (tokens,)
+            if expert_mask.any():
+                expert_in = x_flat[expert_mask]  # (tokens_e, C)
+                expert_out = self.experts[e](expert_in)  # (tokens_e, C)
+                out_flat[expert_mask] = expert_out * top1_val[expert_mask].unsqueeze(
+                    -1
+                )  # (tokens_e, C)
+
+        out = out_flat.view(B, T, C)  # (B, T, C)
+        return out, aux_loss
+
+
 class Block(nn.Module):
     """Transformer block: communication followed by computation"""
 
-    def __init__(self, n_embd, n_head, n_kv_head):
+    def __init__(self, n_embd, n_head, n_kv_head, use_moe):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
+        self.use_moe = use_moe
         head_size = n_embd // n_head
         self.sa = GroupedQueryAttention(n_head, n_kv_head, head_size)
-        self.ffwd = FeedFoward(n_embd)
+        if self.use_moe:
+            self.ffwd = MoEFeedForward(n_embd, num_experts=num_experts)
+        else:
+            self.ffwd = FeedFoward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-        return x
+        ffwd_out = self.ffwd(self.ln2(x))
+        if self.use_moe:
+            ffwd_out, aux_loss = ffwd_out
+        else:
+            aux_loss = 0.0
+        x = x + ffwd_out
+        return x, aux_loss
 
 
 # super simple bigram model
@@ -230,9 +289,12 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.blocks = nn.Sequential(
-            *[Block(n_embd, n_head=n_head, n_kv_head=n_kv_head) for _ in range(n_layer)]
-        )
+        self.blocks = nn.ModuleList()
+        for i in range(n_layer):
+            use_moe_layer = use_moe and (i + 1) in {2, 4, 6}
+            self.blocks.append(
+                Block(n_embd, n_head=n_head, n_kv_head=n_kv_head, use_moe=use_moe_layer)
+            )
         self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
@@ -242,7 +304,10 @@ class BigramLanguageModel(nn.Module):
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
         x = tok_emb  # (B,T,C)
-        x = self.blocks(x)  # (B,T,C)
+        aux_loss_total = 0.0
+        for block in self.blocks:
+            x, aux_loss = block(x)  # (B,T,C)
+            aux_loss_total += aux_loss
         x = self.ln_f(x)  # (B,T,C)
         logits = self.lm_head(x)  # (B,T,vocab_size)
 
@@ -253,7 +318,7 @@ class BigramLanguageModel(nn.Module):
             logits = logits.view(B * T, C)
             targets = targets.view(B * T)
             loss = F.cross_entropy(logits, targets)
-
+            loss = loss + aux_loss_total * aux_loss_weight
         return logits, loss
 
     def generate(self, idx, max_new_tokens):
