@@ -18,6 +18,8 @@ max_iters = 10000
 eval_interval_procentage = 0.25
 eval_interval = max_iters * eval_interval_procentage
 adamw_lr, muon_lr = 3e-4, 8e-4
+warmup_fraction = 0.02
+min_lr_ratio = 0.1
 if not torch.cuda.is_available():
     raise RuntimeError(
         "CUDA is required. Install a CUDA/ROCm-enabled PyTorch build and rerun."
@@ -38,7 +40,7 @@ pre_layers = 2
 post_layers = 2
 xT_loops = 4
 lora_rank = 4
-warmup_steps = 5  # exclude startup transients from summary stats
+warmup_steps = max(1, int(math.ceil(max_iters * warmup_fraction)))
 amp_dtype = torch.bfloat16
 rope_base = 10000
 # ------------
@@ -569,6 +571,23 @@ def partition_optimizer_params(model):
     return muon_params, adamw_params
 
 
+def get_lr_scale(step, warmup_steps, total_steps, min_lr_ratio):
+    if total_steps <= warmup_steps:
+        return 1.0
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / (total_steps - warmup_steps)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
+def apply_lr(optimizer, base_lr, scale):
+    lr = base_lr * scale
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
 # create PyTorch optimizers
 muon_params, adamw_params = partition_optimizer_params(model)
 
@@ -651,6 +670,9 @@ with raw_log_path.open("w", newline="", encoding="utf-8") as csv_file:
         step_start_time = time.perf_counter()
 
         # evaluate the loss
+        lr_scale = get_lr_scale(iter, warmup_steps, max_iters, min_lr_ratio)
+        apply_lr(muon_optimizer, muon_lr, lr_scale)
+        apply_lr(adamw_optimizer, adamw_lr, lr_scale)
         muon_optimizer.zero_grad(set_to_none=True)
         adamw_optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype):
@@ -710,7 +732,9 @@ summary_lines = [
     f"adamw_lr={adamw_lr}",
     f"muon_lr={muon_lr}",
     f"max_iters={max_iters}",
+    f"warmup_fraction={warmup_fraction}",
     f"warmup_steps={warmup_steps}",
+    f"min_lr_ratio={min_lr_ratio}",
     f"autocast_dtype={amp_dtype}",
     f"torch_compile=enabled",
     f"tokens_seen={tokens_seen}",
