@@ -30,10 +30,14 @@ n_kv_head = 2
 n_layer = 6
 moe_layer_set = {i for i in range(1, n_layer + 1) if i % 2 == 0}
 dropout = 0.2
-use_moe = True
+use_moe_recurrent = True
 capacity_factor = 1.25
 num_experts = 4
 aux_loss_weight = 0.01
+pre_layers = 2
+post_layers = 2
+xT_loops = 4
+lora_rank = 4
 warmup_steps = 5  # exclude startup transients from summary stats
 amp_dtype = torch.bfloat16
 rope_base = 10000
@@ -281,6 +285,196 @@ class Block(nn.Module):
             aux_loss = 0.0
         x = x + ffwd_out
         return x, aux_loss
+    
+class BlockLoRA(nn.Module):
+    def __init__(self, n_embd, n_head, n_kv_head, use_moe):
+        super().__init__()
+        self.use_moe = use_moe
+        head_size = n_embd // n_head
+        self.sa = GroupedQueryAttentionLoRA(n_head, n_kv_head, head_size)
+        if self.use_moe:
+            self.ffwd = MoEFeedForwardLoRA(n_embd, num_experts=num_experts)
+        else:
+            self.ffwd = FeedForwardLoRA(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x, adapter_id):
+        x = x + self.sa(self.ln1(x), adapter_id)
+        ffwd_out = self.ffwd(self.ln2(x), adapter_id)
+        if self.use_moe:
+            ffwd_out, aux_loss = ffwd_out
+        else:
+            aux_loss = 0.0
+        x = x + ffwd_out
+        return x, aux_loss
+    
+class RecurrentBlock(nn.Module):
+    def __init__(self, n_embd, n_head, n_kv_head, use_moe):
+        super().__init__()
+        self.core = BlockLoRA(n_embd, n_head, n_kv_head, use_moe)
+
+    def forward(self, x):
+        aux_total = 0.0
+        for i in range(xT_loops):
+            x, aux = self.core(x, adapter_id=i)
+            aux_total += aux
+        return x, aux_total
+
+class LoRALinear(nn.Module):
+    def __init__(self, in_n_embd, out_n_embd, r, num_loops, alpha=1.0, bias=False):
+        super().__init__()
+        self.base = nn.Linear(in_n_embd, out_n_embd, bias=bias) # frozen base weights 
+
+        
+        self.r = r # scaling factor for LoRA updates
+        self.scale = alpha / r
+        # LoRA parameters for each num_loops
+        self.lora_A = nn.Parameter(torch.zeros(num_loops, r, in_n_embd)) # (num_loops, r, in_n_embd)
+        self.lora_B = nn.Parameter(torch.zeros(num_loops, out_n_embd, r)) # (num_loops, out_n_embd, r)
+
+        # Simple init: small random for A, zeros for B.
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5)) # weight init that stabilizes training
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x, adapter_id):
+        out = self.base(x) # Wx, frozen weights
+
+        # fall back to base behavior if no adapter_id is provided
+        if adapter_id is None:
+            return out
+
+        # Select LoRA weights for this loop.
+        A = self.lora_A[adapter_id]  # (r, in_n_embd)
+        B = self.lora_B[adapter_id]  # (out_n_embd, r)
+
+        delta = F.linear(F.linear(x, A), B) * self.scale # (B @ (A @ x)) * scale
+        return out + delta # Wx + B @ A @ x
+
+class GroupedQueryAttentionLoRA(nn.Module):
+    def __init__(self, num_query_heads, num_kv_heads, head_size):
+        super().__init__()
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.query_heads_per_kv = num_query_heads // num_kv_heads
+
+        self.q_proj = nn.LoRALinear(n_embd, num_query_heads * head_size, r=lora_rank, num_loops=xT_loops)
+        self.k_proj = nn.LoRALinear(n_embd, num_kv_heads * head_size, r=lora_rank, num_loops=xT_loops)
+        self.v_proj = nn.LoRALinear(n_embd, num_kv_heads * head_size, r=lora_rank, num_loops=xT_loops)
+        self.proj = nn.LoRALinear(n_embd, n_embd, r=lora_rank, num_loops=xT_loops)
+        self.attn_dropout_p = dropout
+        self.resid_dropout = nn.Dropout(dropout)
+        self.rope_base = rope_base
+        self.register_buffer("rope_cos", torch.empty(0), persistent=False)
+        self.register_buffer("rope_sin", torch.empty(0), persistent=False)
+
+    def forward(self, x, adapter_id):
+        B, T, _ = x.shape
+        q = self.q_proj(x, adapter_id).view(B, T, self.num_query_heads, self.head_size).transpose(1, 2)
+        k = self.k_proj(x, adapter_id).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
+        v = self.v_proj(x, adapter_id).view(B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
+
+        if (
+            self.rope_cos.numel() == 0
+            or self.rope_cos.size(0) < T
+            or self.rope_cos.device != q.device
+            or self.rope_cos.dtype != q.dtype
+        ):
+            cos, sin = build_rope_cache(
+                seq_len=T,
+                head_dim=self.head_size,
+                base=self.rope_base,
+                device=q.device,
+                dtype=q.dtype,
+            )
+            self.rope_cos = cos
+            self.rope_sin = sin
+
+        cos = self.rope_cos[:T].unsqueeze(0).unsqueeze(0)
+        sin = self.rope_sin[:T].unsqueeze(0).unsqueeze(0)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        if self.query_heads_per_kv > 1:
+            k = k.repeat_interleave(self.query_heads_per_kv, dim=1)
+            v = v.repeat_interleave(self.query_heads_per_kv, dim=1)
+
+        attn_dropout = self.attn_dropout_p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=attn_dropout,
+            is_causal=True,
+        )
+
+        out = out.transpose(1, 2).contiguous().view(B, T, n_embd)
+        out = self.resid_dropout(self.proj(out, adapter_id))
+        return out
+    
+class FeedForwardLoRA(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            LoRALinear(n_embd, 4 * n_embd, r=lora_rank, num_loops=xT_loops),
+            nn.ReLU(),
+            LoRALinear(4 * n_embd, n_embd, r=lora_rank, num_loops=xT_loops),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, adapter_id):
+        for layer in self.net:
+            if isinstance(layer, LoRALinear):
+                x = layer(x, adapter_id)
+            else:
+                x = layer(x)
+        return x
+
+class MoEFeedForwardLoRA(nn.Module):
+    def __init__(self, n_embd, num_experts=4):
+        super().__init__()
+        self.num_experts = num_experts
+        self.router = nn.Linear(n_embd, num_experts)
+        self.experts = nn.ModuleList([FeedForwardLoRA(n_embd) for _ in range(num_experts)])
+
+    def forward(self, x, adapter_id):
+        # x: (B, T, C)
+        B, T, C = x.shape
+        x_flat = x.view(B * T, C)  # (tokens, C), tokens = B*T
+
+        router_logits = self.router(x_flat)  # (tokens, E)
+        router_probs = F.softmax(router_logits, dim=-1)  # (tokens, E)
+
+        top1_val, top1_idx = router_probs.max(dim=-1)  # (tokens,), (tokens,)
+        top1_mask = F.one_hot(
+            top1_idx, num_classes=self.num_experts
+        ).float()  # (tokens, E)
+
+        capacity = int(math.ceil(capacity_factor * (B * T) / self.num_experts))
+
+        positions = torch.cumsum(top1_mask, dim=0) - 1  # (tokens, E)
+        dispatch_mask = (positions < capacity) * top1_mask  # (tokens, E)
+
+        importance = router_probs.mean(dim=0)  # (E,)
+        load = dispatch_mask.mean(dim=0)  # (E,)
+        aux_loss = (importance * load).sum() * self.num_experts  # scalar
+        out_flat = torch.zeros_like(x_flat)  # (tokens, C)
+
+        for e in range(self.num_experts):
+            expert_mask = dispatch_mask[:, e].bool()  # (tokens,)
+            if expert_mask.any():
+                expert_in = x_flat[expert_mask]  # (tokens_e, C)
+                expert_out = self.experts[e](expert_in, adapter_id)  # (tokens_e, C)
+                out_flat[expert_mask] = expert_out * top1_val[expert_mask].unsqueeze(
+                    -1
+                )  # (tokens_e, C)
+
+        out = out_flat.view(B, T, C)  # (B, T, C)
+        return out, aux_loss 
+
+
 
 
 # super simple bigram model
@@ -291,11 +485,11 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.blocks = nn.ModuleList()
-        for i in range(n_layer):
-            use_moe_layer = use_moe and (i + 1) in moe_layer_set
-            self.blocks.append(
-                Block(n_embd, n_head=n_head, n_kv_head=n_kv_head, use_moe=use_moe_layer)
-            )
+        for i in range(pre_layers):
+            self.blocks.append(Block(n_embd, n_head=n_head, n_kv_head=n_kv_head, use_moe=False))
+        self.blocks.append(RecurrentBlock(n_embd, n_head=n_head, n_kv_head=n_kv_head, use_moe=use_moe_recurrent))
+        for k in range(post_layers):
+            self.blocks.append(Block(n_embd, n_head=n_head, n_kv_head=n_kv_head, use_moe=False))
         self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
