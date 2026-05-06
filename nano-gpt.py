@@ -14,10 +14,10 @@ from data_loader import FineWebShardData
 # hyperparameters
 batch_size = 32  #  paraller predictions
 block_size = 64  # max context length for predictions
-max_iters = 1000
+max_iters = 10000
 eval_interval_procentage = 0.25
 eval_interval = max_iters * eval_interval_procentage
-learning_rate = 3e-4
+adamw_lr, muon_lr = 3e-4, 8e-4
 if not torch.cuda.is_available():
     raise RuntimeError(
         "CUDA is required. Install a CUDA/ROCm-enabled PyTorch build and rerun."
@@ -539,12 +539,58 @@ model = torch.compile(model)
 m = model
 
 
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, foreach=False)
+def should_use_muon(name, param):
+    if param.ndim != 2:
+        return False
+    if "ffwd" not in name:
+        return False
+    skip_names = (
+        "token_embedding_table",
+        "lm_head",
+        "embedding",
+        "ln",
+        "layernorm",
+        "lora_",
+        "router",
+    )
+    return not any(skip in name for skip in skip_names)
+
+
+def partition_optimizer_params(model):
+    muon_params = []
+    adamw_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if should_use_muon(name, param):
+            muon_params.append(param)
+        else:
+            adamw_params.append(param)
+    return muon_params, adamw_params
+
+
+# create PyTorch optimizers
+muon_params, adamw_params = partition_optimizer_params(model)
+
+muon_optimizer = torch.optim.Muon(
+    muon_params,
+    lr=muon_lr,
+    ns_steps=2,
+    weight_decay=0.1,
+    momentum=0.95,
+    nesterov=True,
+    adjust_lr_fn="match_rms_adamw",
+)
+adamw_optimizer = torch.optim.AdamW(
+    adamw_params,
+    lr=adamw_lr,
+    weight_decay=0.0,
+    foreach=False,
+)
 
 run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 arch_mode = "mha" if n_kv_head == n_head else "gqa"
-lr_tag = f"{learning_rate:.0e}".replace("e-0", "e-").replace("e+0", "e+")
+lr_tag = f"{adamw_lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
 run_name = (
     f"{arch_mode}_nh{n_head}_nkv{n_kv_head}_nl{n_layer}_ne{n_embd}_"
     f"bs{batch_size}_ctx{block_size}_lr{lr_tag}_it{max_iters}"
@@ -605,12 +651,14 @@ with raw_log_path.open("w", newline="", encoding="utf-8") as csv_file:
         step_start_time = time.perf_counter()
 
         # evaluate the loss
-        optimizer.zero_grad(set_to_none=True)
+        muon_optimizer.zero_grad(set_to_none=True)
+        adamw_optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype):
             logits, loss = model(xb, yb)
 
         loss.backward()
-        optimizer.step()
+        muon_optimizer.step()
+        adamw_optimizer.step()
 
         tokens_step = yb.numel()
         tokens_seen += tokens_step
@@ -659,7 +707,8 @@ summary_lines = [
     f"n_embd={n_embd}",
     f"batch_size={batch_size}",
     f"block_size={block_size}",
-    f"learning_rate={learning_rate}",
+    f"adamw_lr={adamw_lr}",
+    f"muon_lr={muon_lr}",
     f"max_iters={max_iters}",
     f"warmup_steps={warmup_steps}",
     f"autocast_dtype={amp_dtype}",
