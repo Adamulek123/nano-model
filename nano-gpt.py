@@ -359,10 +359,10 @@ class GroupedQueryAttentionLoRA(nn.Module):
         self.head_size = head_size
         self.query_heads_per_kv = num_query_heads // num_kv_heads
 
-        self.q_proj = nn.LoRALinear(n_embd, num_query_heads * head_size, r=lora_rank, num_loops=xT_loops)
-        self.k_proj = nn.LoRALinear(n_embd, num_kv_heads * head_size, r=lora_rank, num_loops=xT_loops)
-        self.v_proj = nn.LoRALinear(n_embd, num_kv_heads * head_size, r=lora_rank, num_loops=xT_loops)
-        self.proj = nn.LoRALinear(n_embd, n_embd, r=lora_rank, num_loops=xT_loops)
+        self.q_proj = LoRALinear(n_embd, num_query_heads * head_size, r=lora_rank, num_loops=xT_loops)
+        self.k_proj = LoRALinear(n_embd, num_kv_heads * head_size, r=lora_rank, num_loops=xT_loops)
+        self.v_proj = LoRALinear(n_embd, num_kv_heads * head_size, r=lora_rank, num_loops=xT_loops)
+        self.proj = LoRALinear(n_embd, n_embd, r=lora_rank, num_loops=xT_loops)
         self.attn_dropout_p = dropout
         self.resid_dropout = nn.Dropout(dropout)
         self.rope_base = rope_base
