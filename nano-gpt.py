@@ -40,6 +40,8 @@ pre_layers = 2
 post_layers = 2
 xT_loops = 4
 lora_rank = 4
+LTI_A_decay = 0.9
+LTI_B_decay = 0.1
 warmup_steps = max(1, int(math.ceil(max_iters * warmup_fraction)))
 amp_dtype = torch.bfloat16
 rope_base = 10000
@@ -477,6 +479,18 @@ class MoEFeedForwardLoRA(nn.Module):
         return out, aux_loss 
 
 
+class LTIinjection(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.raw_a = nn.Parameter(torch.zeros(n_embd)) # (n_embd)
+        self.a = torch.sigmoid(self.raw_a) # scaled (n_embd) of 0.5
+        self.B = nn.Parameter(torch.rand(n_embd, n_embd) * LTI_B_decay, requires_grad=False) # (n_embd, n_embd) * decay
+
+    def forward(self, x):
+        x_tbc = x.transpose(0, 1)  # (T, B, C)
+        H_embd = self.A.size(0)  # (n_embd)
+
+        return self.lti(x)
 
 
 # super simple bigram model
