@@ -479,6 +479,22 @@ class MoEFeedForwardLoRA(nn.Module):
         return out, aux_loss 
 
 
+def lti_scan_loop(x, a, B,h0=None):
+    Bsize, T, C = x.shape
+    H = a.numel()
+
+    if h0 is None:
+        h = x.new_zeros(Bsize, H)
+    else:
+        h = h0
+
+    outputs = []
+    for t in range(T):
+        x_t = x[:, t, :]          # [B, C]
+        h = h * a + x_t @ B.T     # [B, H]
+        outputs.append(h)
+
+    return torch.stack(outputs, dim=1)  # [B, T, H]
 class LTIinjection(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
@@ -487,8 +503,6 @@ class LTIinjection(nn.Module):
         self.B = nn.Parameter(torch.rand(n_embd, n_embd) * LTI_B_decay, requires_grad=False) # (n_embd, n_embd) * decay
 
     def forward(self, x):
-        x_tbc = x.transpose(0, 1)  # (T, B, C)
-        H_embd = self.A.size(0)  # (n_embd)
 
         return self.lti(x)
 
