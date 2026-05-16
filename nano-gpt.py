@@ -40,8 +40,7 @@ pre_layers = 2
 post_layers = 2
 xT_loops = 4
 lora_rank = 4
-LTI_A_decay = 0.9
-LTI_B_decay = 0.1
+lti_init_decay = 0.95
 warmup_steps = max(1, int(math.ceil(max_iters * warmup_fraction)))
 amp_dtype = torch.bfloat16
 rope_base = 10000
@@ -317,14 +316,46 @@ class RecurrentBlock(nn.Module):
     def __init__(self, n_embd, n_head, n_kv_head, use_moe):
         super().__init__()
         self.core = BlockLoRA(n_embd, n_head, n_kv_head, use_moe)
+        self.lti = LTIinjection(n_embd)
+        self.halt_proj = nn.Linear(n_embd, 1)
+        self.max_loops = xT_loops  # ACT upper bound
 
     def forward(self, x):
+        B, T, C = x.shape
         aux_total = 0.0
-        for i in range(xT_loops):
-            x, aux = self.core(x, adapter_id=i)
-            aux_total += aux
-        return x, aux_total
 
+        p_t = x.new_zeros(B)             # cumulative halting probability
+        n_updates = x.new_zeros(B)
+        weighted_sum = x.new_zeros(B, T, C)
+
+        for i in range(self.max_loops):
+            x_new, aux = self.core(x, adapter_id=i)
+            aux_total += aux
+
+            # LTI injection
+            lti_out = self.lti(x_new)
+            x_new = x_new + lti_out
+
+            # halting probability per sample
+            p = torch.sigmoid(self.halt_proj(x_new.mean(dim=1))).squeeze(-1)  # [B]
+
+            # ACT halting logic (correct)
+            still_running = (p_t < 1.0).float()
+            p = p * still_running
+
+            remainder = 1.0 - p_t
+            update = torch.min(p, remainder)
+
+            weighted_sum = weighted_sum + update[:, None, None] * x_new
+            p_t = p_t + update
+            n_updates = n_updates + still_running
+
+            if (p_t >= 1.0).all():
+                break
+
+            x = x_new
+
+        return weighted_sum, aux_total
 class LoRALinear(nn.Module):
     def __init__(self, in_n_embd, out_n_embd, r, num_loops, alpha=1.0, bias=False):
         super().__init__()
@@ -495,16 +526,16 @@ def lti_scan_loop(x, a, B,h0=None):
         outputs.append(h)
 
     return torch.stack(outputs, dim=1)  # [B, T, H]
+
 class LTIinjection(nn.Module):
-    def __init__(self, n_embd):
+    def __init__(self, n_embd,init_decay = lti_init_decay):
         super().__init__()
-        self.raw_a = nn.Parameter(torch.zeros(n_embd)) # (n_embd)
-        self.a = torch.sigmoid(self.raw_a) # scaled (n_embd) of 0.5
-        self.B = nn.Parameter(torch.rand(n_embd, n_embd) * LTI_B_decay, requires_grad=False) # (n_embd, n_embd) * decay
-
-    def forward(self, x):
-
-        return self.lti(x)
+        raw_init = math.log(init_decay / (1 - init_decay))
+        self.raw_a = nn.Parameter(torch.full((n_embd,), raw_init))
+        self.B = nn.Parameter(torch.randn(n_embd, n_embd) * 0.01) # (n_embd, n_embd) * decay 
+    def forward(self, x, h0=None):
+        a = torch.sigmoid(self.raw_a) # (n_embd,) in (0, 1)
+        return lti_scan_loop(x, a, self.B, h0=h0) # (B, T, n_embd)
 
 
 # super simple bigram model
@@ -697,7 +728,7 @@ with raw_log_path.open("w", newline="", encoding="utf-8") as csv_file:
         synchronize_for_timing()
         step_start_time = time.perf_counter()
 
-        # evaluate the loss
+        # evaluate the los
         lr_scale = get_lr_scale(iter, warmup_steps, max_iters, min_lr_ratio)
         apply_lr(muon_optimizer, muon_lr, lr_scale)
         apply_lr(adamw_optimizer, adamw_lr, lr_scale)
